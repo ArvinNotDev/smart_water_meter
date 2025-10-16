@@ -1,5 +1,5 @@
 #include <Wire.h>
-#include "IranGSM.h" // this is a customized version of IranGSM.h
+#include "IranGSM.h" // this is a customized version of IranGSM library
 
 #define RX_PIN A2
 #define TX_PIN A1
