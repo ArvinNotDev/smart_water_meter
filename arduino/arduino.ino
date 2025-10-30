@@ -747,14 +747,22 @@ void processIncomingSms(const String &fromRaw, const String &bodyRaw) {
     return;
   }
 
-  if (up.startsWith("SET MAIN ") ) {
-    String num = body.substring(9);
-    num.trim();
-    if (num.length() == 0) { enqueueSms(from, "INVALID NUMBER"); return; }
-    setTrustedMain(num);
-    enqueueSms(from, String("MAIN SET TO ") + trustedMain);
-    return;
-  }
+  // NOTE: Direct "SET MAIN <number>" single-message handling intentionally removed.
+  // Main number must be set via two-step flow:
+  //   1) "SET MAIN"  -> device replies "SEND NUMBER NOW (20s)"
+  //   2) reply with the full number (must start with '+') within 20s
+  // This matches the behavior of SET ALT and prevents accidental remote reconfiguration.
+  //
+  // If you later want to re-enable single-message setting, restore the block below:
+  // if (up.startsWith("SET MAIN ") ) {
+  //   String num = body.substring(9);
+  //   num.trim();
+  //   if (num.length() == 0) { enqueueSms(from, "INVALID NUMBER"); return; }
+  //   setTrustedMain(num);
+  //   enqueueSms(from, String("MAIN SET TO ") + trustedMain);
+  //   return;
+  // }
+
   if (up.startsWith("SET ALT ") || up.startsWith("SET SECOND ")) {
     String num = (up.startsWith("SET ALT ")) ? body.substring(8) : body.substring(11);
     num.trim();
