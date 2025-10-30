@@ -16,8 +16,8 @@
 #define PIN_HALL 2
 
 // LED mapping per user: RED = D6, GREEN = D7, BLUE = D5
-#define LED_R 7
-#define LED_G 6
+#define LED_R 6
+#define LED_G 7
 #define LED_B 5
 
 // Optional: control GSM power (set to -1 to disable)
@@ -35,11 +35,14 @@
 
 // === Internal EEPROM layout ===
 #define IEEP_PPL_ADDR          0   // uint16_t (2 bytes) -> pulses per liter
+#define IEEP_TRUST1_ADDR       2   // 32 bytes for main trusted number (ASCII)
+#define IEEP_TRUST2_ADDR       34  // 32 bytes for secondary trusted number (ASCII)
+#define TRUSTED_STR_MAXLEN     32
 
 // Tunables
 #define EEPROM_NUM_MAXCHUNK    140
 #define DEFAULT_PULSES_PER_LITER 670U
-#define LITERS_PER_SAVE 5
+#define LITERS_PER_SAVE 3   // changed from 5 -> 3 as requested
 
 // Global IranGSM instance (as you had it)
 IranGSM myGSM(RX_PIN, TX_PIN);
@@ -51,12 +54,20 @@ const uint8_t GSM_CONSECUTIVE_SUCCESS     = 3;
 const int GSM_MIN_RSSI                    = 5; // set -1 to accept >=0
 
 // Startup simplification params
-const unsigned long STARTUP_RED_MS = 15000UL; // wait 15s red on boot
+const unsigned long STARTUP_RED_MS = 8000UL; // wait 8s red on boot
 const unsigned long AT_RETRY_MS = 5000UL;     // wait 5s between AT+CREG? retries
 const int POWER_CYCLE_AFTER_ATTEMPTS = 4;     // attempt power-cycle after this many failed probes
 
 const bool DEBUG = true;
-const String TRUSTED_NUMBER = "+989355690823";
+
+// default fallback (will be overridden by EEPROM if present)
+const char DEFAULT_TRUST_1[] = "+989355690823";
+const char DEFAULT_TRUST_2[] = "";
+bool ledCommonAnode = true;
+
+// runtime stored trusted numbers (loaded from internal EEPROM)
+String trustedMain = String(DEFAULT_TRUST_1);
+String trustedAlt  = String(DEFAULT_TRUST_2);
 
 // runtime counters
 volatile unsigned int pulseCounter = 0;
@@ -82,7 +93,11 @@ bool ledBlinkState = false;
 uint8_t gsmSuccessCount = 0;
 unsigned long gsmCandidateSince = 0;
 
+// Track START delivery per recipient
 volatile bool startSent = false;
+volatile bool startSentMain = false;
+volatile bool startSentAlt  = false;
+
 bool hallAttached = false;
 
 // Watchdog state
@@ -92,17 +107,33 @@ const int WDT_TIMEOUT_SECONDS = 8; // used for debug output; actual period uses 
 // If using common-anode LEDs (HIGH -> off), set true
 const bool COMMON_ANODE = false;
 
+// ---------- Pending SET state (two-step number set) ----------
+enum PendingSetType : uint8_t { PENDING_NONE = 0, PENDING_MAIN = 1, PENDING_ALT = 2 };
+volatile uint8_t pendingSetType = PENDING_NONE; // which type we're waiting for
+String pendingSetFromOrig = "";   // original formatted sender string to reply to
+String pendingSetFromNorm = "";   // normalized no-space etc for comparisons
+unsigned long pendingSetAt = 0;
+const unsigned long PENDING_TIMEOUT_MS = 20000UL; // 20 seconds
+
+// ---------- START sequencing (send main then alt after delay) ----------
+bool startSeqPendingAlt = false;
+unsigned long startSeqAltAt = 0;
+const unsigned long START_ALT_DELAY_MS = 3000UL; // 3 seconds
+
 // ---------- helpers ----------
 void setLED_raw(bool r, bool g, bool b) {
   digitalWrite(LED_R, r ? HIGH : LOW);
   digitalWrite(LED_G, g ? HIGH : LOW);
   digitalWrite(LED_B, b ? HIGH : LOW);
 }
-void setLED(bool r, bool g, bool b) {
-  if (COMMON_ANODE) setLED_raw(!r, !g, !b);
-  else setLED_raw(r,g,b);
+void setLED(bool r_unused, bool g, bool b) {
+  bool r = true;
+  if (ledCommonAnode) {
+    setLED_raw(!r, !g, !b);
+  } else {
+    setLED_raw(r, g, b);
+  }
 }
-
 // Watchdog helpers (AVR only)
 void enableWatchdogIfNeeded() {
 #if WDT_AVAILABLE
@@ -145,13 +176,44 @@ void countPulse() {
   }
 }
 
-// ---------- external EEPROM (unchanged logic, but we feed WDT inside loops) ----------
+// ---------- internal EEPROM string helpers ----------
+String iEepromReadString(uint16_t addr, uint8_t maxlen) {
+  String s = "";
+  for (uint8_t i = 0; i < maxlen; ++i) {
+    uint8_t b = EEPROM.read(addr + i);
+    if (b == 0xFF || b == 0x00) break; // treat 0xFF/0x00 as unused terminator
+    s += (char)b;
+  }
+  return s;
+}
+
+void iEepromWriteString(uint16_t addr, const String &s, uint8_t maxlen) {
+  uint8_t i = 0;
+  for (; i < maxlen; ++i) {
+    if (i < s.length()) {
+      EEPROM.update(addr + i, (uint8_t)s[i]);
+    } else {
+      EEPROM.update(addr + i, 0xFF); // mark unused
+    }
+  }
+}
+
+// Helper to validate phone number
+bool isValidPhoneNumber(const String &num) {
+  if (num.length() < 10 || num.length() > 15) return false;
+  if (!num.startsWith("+")) return false;
+  for (size_t i = 1; i < num.length(); ++i) {
+    if (!isDigit(num[i])) return false;
+  }
+  return true;
+}
+
+// ---------- external EEPROM functions (unchanged) ----------
 void eeprom_wait_ready() {
   while (true) {
     Wire.beginTransmission(EEPROM_I2C_ADDR);
     uint8_t e = Wire.endTransmission();
     if (e == 0) break;
-    // feed WDT while waiting
     feedWatchdog();
     delayMicroseconds(500);
   }
@@ -170,14 +232,12 @@ void eeprom_write_pagewise(uint16_t addr, const uint8_t* data, uint16_t len) {
       Wire.write((uint8_t)(addr & 0xFF));
       for (uint8_t i = 0; i < sub; i++) {
         Wire.write(data[offset + i]);
-        // occasional WDT feed for very long writes (rare)
         if ((i & 15) == 0) feedWatchdog();
       }
       Wire.endTransmission();
       eeprom_wait_ready();
       addr += sub; offset += sub; remaining -= sub; chunk -= sub;
     }
-    // feed watchdog between page chunks
     feedWatchdog();
   }
 }
@@ -268,12 +328,13 @@ void saveLitersToEEPROM(uint16_t liters) {
 }
 
 // ---------- SMS queue ----------
+// assign fields first then set used last (avoids partially filled slot)
 void enqueueSms(const String &to, const String &txt) {
   for (int i = 0; i < SMS_Q_SZ; i++) {
     if (!smsQ[i].used) {
-      smsQ[i].used = true;
       smsQ[i].to = to;
       smsQ[i].txt = txt;
+      smsQ[i].used = true;
       if (DEBUG) { Serial.print(F("Enqueue SMS -> ")); Serial.print(to); Serial.print(F(" : ")); Serial.println(txt); }
       return;
     }
@@ -281,37 +342,75 @@ void enqueueSms(const String &to, const String &txt) {
   if (DEBUG) Serial.println(F("SMS queue full; dropping message"));
 }
 
+// serviceSmsOut: send up to N messages per call (small number) to avoid long blocking
+const uint8_t SERVICE_MAX_PER_CALL = 3;
 void serviceSmsOut() {
-  for (int i = 0; i < SMS_Q_SZ; i++) {
+  uint8_t sentThisCall = 0;
+  for (int i = 0; i < SMS_Q_SZ && sentThisCall < SERVICE_MAX_PER_CALL; i++) {
     if (smsQ[i].used) {
-      if (DEBUG) { Serial.print(F("Sending (IranGSM) -> ")); Serial.print(smsQ[i].to); Serial.print(F(" : ")); Serial.println(smsQ[i].txt); }
-      myGSM.SMS_Send(smsQ[i].to, smsQ[i].txt);
+      // copy locally, clear slot immediately
+      String toLocal = smsQ[i].to;
+      String txtLocal = smsQ[i].txt;
+      smsQ[i].used = false;
+      smsQ[i].to = "";
+      smsQ[i].txt = "";
 
-      // If this was the START message to the main trusted number, mark that START was sent
-      if (!startSent) {
-        String toNorm = smsQ[i].to;
-        toNorm.replace(" ", ""); toNorm.replace("(", ""); toNorm.replace(")", "");
-        String tNorm = TRUSTED_NUMBER;
-        tNorm.replace(" ", ""); tNorm.replace("(", ""); tNorm.replace(")", "");
-        if (smsQ[i].txt == "START" && toNorm == tNorm) {
-          startSent = true;
-          setLED(false, true, false); // green
-          if (DEBUG) Serial.println(F("START SMS actually sent -> LED GREEN"));
-
-          // Enable watchdog now that START is actually sent
-          enableWatchdogIfNeeded();
-        }
+      if (DEBUG) {
+        Serial.print(F("Sending (IranGSM) -> "));
+        Serial.print(toLocal);
+        Serial.print(F(" : "));
+        Serial.println(txtLocal);
       }
 
-      smsQ[i].used = false;
-      smsQ[i].to = ""; smsQ[i].txt = "";
+      // Perform the actual send (may block inside library)
+      myGSM.SMS_Send(toLocal, txtLocal);
+
+      // Update START-delivery booleans if relevant
+      if (txtLocal == "START") {
+        String toNorm = toLocal;
+        toNorm.replace(" ", ""); toNorm.replace("(", ""); toNorm.replace(")", "");
+        String tMain = trustedMain; tMain.replace(" ", ""); tMain.replace("(", ""); tMain.replace(")", "");
+        String tAlt  = trustedAlt;  tAlt.replace(" ", ""); tAlt.replace("(", ""); tAlt.replace(")", "");
+
+        // mark which recipient got START
+        if (tMain.length() > 0 && toNorm == tMain) {
+          startSentMain = true;
+          if (DEBUG) Serial.println(F("START sent to MAIN (flagged)"));
+        }
+        if (tAlt.length() > 0 && toNorm == tAlt) {
+          startSentAlt = true;
+          if (DEBUG) Serial.println(F("START sent to ALT (flagged)"));
+        }
+
+        // =========== LED logic change ===========
+        // GREEN should turn steady only after ALT START is actually sent.
+        // If ALT doesn't exist, green turns on after MAIN START.
+        bool readyGreen = false;
+        if (trustedAlt.length() == 0) {
+          // no alt configured — green after main start
+          readyGreen = startSentMain;
+        } else {
+          // alt configured — green only after alt actually sent
+          readyGreen = startSentAlt;
+        }
+
+        if (readyGreen && !startSent) {
+          startSent = true;
+          // keep RED on always; turn GREEN steady now
+          setLED(true, true, false); // RED always ON, GREEN ON
+          if (DEBUG) Serial.println(F("Ready: GREEN turned ON (RED remains ON)"));
+          enableWatchdogIfNeeded();
+        }
+        // ========================================
+      }
+
       if (DEBUG) Serial.println(F("SMS Sent (IranGSM)"));
-      return; // send one SMS per serviceSmsOut call
+      sentThisCall++;
     }
   }
 }
 
-// Request save: only short critical section to copy volatile
+// Request save: only short critical section
 void requestSave(uint16_t liters) {
   noInterrupts();
   saveRequestedLiters = liters;
@@ -363,6 +462,7 @@ void iEepromSetPPL(uint16_t val) {
 }
 
 void iEepromInitIfNeeded() {
+  // ensure PPL
   uint8_t lo = EEPROM.read(IEEP_PPL_ADDR);
   uint8_t hi = EEPROM.read(IEEP_PPL_ADDR + 1);
   uint16_t val = ((uint16_t)hi << 8) | lo;
@@ -375,21 +475,77 @@ void iEepromInitIfNeeded() {
     EEPROM.update(IEEP_PPL_ADDR + 1, dhi);
     delay(10);
   }
+
+  // ensure trustedMain/Alt initialization if empty or invalid
+  String t1 = iEepromReadString(IEEP_TRUST1_ADDR, TRUSTED_STR_MAXLEN);
+  String t2 = iEepromReadString(IEEP_TRUST2_ADDR, TRUSTED_STR_MAXLEN);
+
+  if (t1.length() == 0 || !isValidPhoneNumber(t1)) {
+    if (DEBUG) Serial.println(F("Internal EEPROM trustedMain uninitialized or invalid; writing default"));
+    iEepromWriteString(IEEP_TRUST1_ADDR, String(DEFAULT_TRUST_1), TRUSTED_STR_MAXLEN);
+  }
+  // do not force-default secondary; but clear if invalid
+  if (t2.length() > 0 && !isValidPhoneNumber(t2)) {
+    if (DEBUG) Serial.println(F("Internal EEPROM trustedAlt invalid; clearing"));
+    iEepromWriteString(IEEP_TRUST2_ADDR, "", TRUSTED_STR_MAXLEN);
+  }
+
   pulsesPerLiterVar = iEepromGetPPL();
+
+  // load into runtime strings
+  trustedMain = iEepromReadString(IEEP_TRUST1_ADDR, TRUSTED_STR_MAXLEN);
+  trustedAlt  = iEepromReadString(IEEP_TRUST2_ADDR, TRUSTED_STR_MAXLEN);
+
   if (DEBUG) {
-    Serial.print(F("Loaded PPL: "));
-    Serial.println(pulsesPerLiterVar);
+    Serial.print(F("Loaded PPL: ")); Serial.println(pulsesPerLiterVar);
+    Serial.print(F("Loaded trustedMain: ")); Serial.println(trustedMain);
+    Serial.print(F("Loaded trustedAlt: ")); Serial.println(trustedAlt);
   }
 }
 
+// Helper to update trusted numbers in EEPROM and runtime
+void setTrustedMain(const String &num) {
+  String s = trimNumberFormatting(num);
+  if (s.length() == 0) return;
+  iEepromWriteString(IEEP_TRUST1_ADDR, s, TRUSTED_STR_MAXLEN);
+  trustedMain = s;
+  if (DEBUG) { Serial.print(F("Set trustedMain to ")); Serial.println(trustedMain); }
+}
+
+void setTrustedAlt(const String &num) {
+  String s = trimNumberFormatting(num);
+  if (s.length() == 0) {
+    // clear alt if empty
+    iEepromWriteString(IEEP_TRUST2_ADDR, "", TRUSTED_STR_MAXLEN);
+    trustedAlt = "";
+    if (DEBUG) Serial.println(F("Cleared trustedAlt"));
+    return;
+  }
+  iEepromWriteString(IEEP_TRUST2_ADDR, s, TRUSTED_STR_MAXLEN);
+  trustedAlt = s;
+  if (DEBUG) { Serial.print(F("Set trustedAlt to ")); Serial.println(trustedAlt); }
+}
+
 // ---------- trusted checks ----------
-bool isSenderMainTrusted(const String &fromRaw) {
+bool isSenderTrusted(const String &fromRaw) {
   String f = fromRaw; f.replace(" ", ""); f.replace("(", ""); f.replace(")", "");
-  String t = TRUSTED_NUMBER; t.replace(" ", ""); t.replace("(", ""); t.replace(")", "");
-  int tailLen = (t.length() >= 11) ? 11 : t.length();
-  String tTail = t.substring(t.length() - tailLen);
-  String fTail = (f.length() > tailLen) ? f.substring(f.length() - tailLen) : f;
-  return fTail == tTail;
+  String tMain = trustedMain; tMain.replace(" ", ""); tMain.replace("(", ""); tMain.replace(")", "");
+  String tAlt  = trustedAlt;  tAlt.replace(" ", ""); tAlt.replace("(", ""); tAlt.replace(")", "");
+
+  int tailLenMain = (tMain.length() >= 11) ? 11 : tMain.length();
+  int tailLenAlt  = (tAlt.length() >= 11)  ? 11 : tAlt.length();
+
+  if (tMain.length() > 0) {
+    String tTail = tMain.substring(tMain.length() - tailLenMain);
+    String fTail = (f.length() > tailLenMain) ? f.substring(f.length() - tailLenMain) : f;
+    if (fTail == tTail) return true;
+  }
+  if (tAlt.length() > 0) {
+    String tTail = tAlt.substring(tAlt.length() - tailLenAlt);
+    String fTail = (f.length() > tailLenAlt) ? f.substring(f.length() - tailLenAlt) : f;
+    if (fTail == tTail) return true;
+  }
+  return false;
 }
 
 // ---------- SMS helpers ----------
@@ -426,15 +582,46 @@ int getGsmRssi() {
   return rssi; // 0..31
 }
 
-void sendStartToTrustedNumbers() {
-  enqueueSms(TRUSTED_NUMBER, "START");
-  if (DEBUG) {
-    Serial.print(F("Queued START to main trusted: "));
-    Serial.println(TRUSTED_NUMBER);
+// New: send main immediately and schedule alt after 3s (non-blocking)
+void sendStartSequence() {
+  // reset per-run flags so they can be set when SMS actually goes out
+  startSentMain = false;
+  startSentAlt = false;
+  startSent = false;
+
+  if (trustedMain.length() > 0) {
+    enqueueSms(trustedMain, "START");
+    if (DEBUG) Serial.print(F("START queued for MAIN immediately\n"));
+  }
+
+  // schedule ALT only if present and different
+  if (trustedAlt.length() > 0 && trustedAlt != trustedMain) {
+    startSeqPendingAlt = true;
+    startSeqAltAt = millis() + START_ALT_DELAY_MS;
+    if (DEBUG) {
+      Serial.print(F("ALT START scheduled in ms="));
+      Serial.println(START_ALT_DELAY_MS);
+    }
+  } else {
+    // if no alt, we can consider main-only satisfied once sent; enabling of watchdog is handled when SMS actually goes out.
+    startSeqPendingAlt = false;
   }
 }
 
-// Probe registration with AT+CREG? — returns true if stat==1 or stat==5 (registered home or roaming)
+bool sendAltIfScheduled() {
+  if (!startSeqPendingAlt) return false;
+  if (millis() >= startSeqAltAt) {
+    // enqueue alt now (if still valid)
+    if (trustedAlt.length() > 0 && trustedAlt != trustedMain) {
+      enqueueSms(trustedAlt, "START");
+      if (DEBUG) Serial.println(F("START queued for ALT (after delay)"));
+    }
+    startSeqPendingAlt = false;
+    return true;
+  }
+  return false;
+}
+
 bool probeGsmRegistration() {
   String r = myGSM.sendAT("AT+CREG?", 2000);
   if (DEBUG) {
@@ -442,14 +629,12 @@ bool probeGsmRegistration() {
   }
   int idx = r.indexOf("+CREG:");
   if (idx == -1) {
-    // fallback: check plain AT OK (module alive) but not registered
     if (r.indexOf("OK") != -1) {
       if (DEBUG) Serial.println(F("AT OK but no +CREG response"));
     }
     return false;
   }
 
-  // parse stat after comma
   int comma = r.indexOf(',', idx);
   int pos = (comma >= 0) ? comma + 1 : idx + 6;
   while (pos < (int)r.length() && !isDigit(r[pos])) pos++;
@@ -464,7 +649,6 @@ bool probeGsmRegistration() {
   return (stat == 1 || stat == 5);
 }
 
-// Attempt a soft power-cycle (if GSM_PWR_PIN wired)
 void softPowerCycleGsm() {
   if (GSM_PWR_PIN < 0) return;
   if (DEBUG) Serial.println(F("Soft power-cycle of GSM: toggling GSM_PWR_PIN"));
@@ -475,6 +659,13 @@ void softPowerCycleGsm() {
     digitalWrite(GSM_PWR_PIN, HIGH); delay(700);
     digitalWrite(GSM_PWR_PIN, LOW); delay(1500);
   }
+}
+
+void clearPendingSet() {
+  pendingSetType = PENDING_NONE;
+  pendingSetFromOrig = "";
+  pendingSetFromNorm = "";
+  pendingSetAt = 0;
 }
 
 // ---------- incoming SMS processing ----------
@@ -489,12 +680,36 @@ void processIncomingSms(const String &fromRaw, const String &bodyRaw) {
   String body = bodyRaw; body.trim();
   String up = body; up.toUpperCase();
 
-  if (!isSenderMainTrusted(fromClean)) {
+  if (!isSenderTrusted(fromClean)) {
     if (DEBUG) Serial.println(F("Ignoring unauthorized sender"));
     return;
   }
 
-  // ADMIN commands
+  // Two-step pending SET handling
+  if (pendingSetType != PENDING_NONE && fromClean == pendingSetFromNorm) {
+    String candidate = trimNumberFormatting(body);
+    if (candidate.length() == 0) {
+      enqueueSms(from, "INVALID NUMBER");
+    } else {
+      if (!candidate.startsWith("+")) {
+        enqueueSms(from, "INVALID NUMBER (must start with +)");
+      } else if (!isValidPhoneNumber(candidate)) {
+        enqueueSms(from, "INVALID NUMBER");
+      } else {
+        if (pendingSetType == PENDING_MAIN) {
+          setTrustedMain(candidate);
+          enqueueSms(from, String("MAIN SET TO ") + trustedMain);
+        } else if (pendingSetType == PENDING_ALT) {
+          setTrustedAlt(candidate);
+          enqueueSms(from, String("ALT SET TO ") + trustedAlt);
+        }
+        clearPendingSet();
+      }
+    }
+    return;
+  }
+
+  // admin & other commands (unchanged)
   if (up.startsWith("SET PPL ") || up.startsWith("SET PULSES ")) {
     String arg = (up.startsWith("SET PPL ")) ? body.substring(8) : body.substring(11);
     arg.trim();
@@ -508,8 +723,54 @@ void processIncomingSms(const String &fromRaw, const String &bodyRaw) {
     return;
   }
 
+  if (up == "SET MAIN") {
+    pendingSetType = PENDING_MAIN;
+    pendingSetFromOrig = from;
+    pendingSetFromNorm = fromClean;
+    pendingSetAt = millis();
+    enqueueSms(from, "SEND NUMBER NOW (20s)");
+    if (DEBUG) {
+      Serial.print(F("Pending SET MAIN from ")); Serial.println(from);
+    }
+    return;
+  }
+
+  if (up == "SET ALT" || up == "SET ALTER" || up == "SET SECOND") {
+    pendingSetType = PENDING_ALT;
+    pendingSetFromOrig = from;
+    pendingSetFromNorm = fromClean;
+    pendingSetAt = millis();
+    enqueueSms(from, "SEND NUMBER NOW (20s)");
+    if (DEBUG) {
+      Serial.print(F("Pending SET ALT from ")); Serial.println(from);
+    }
+    return;
+  }
+
+  if (up.startsWith("SET MAIN ") ) {
+    String num = body.substring(9);
+    num.trim();
+    if (num.length() == 0) { enqueueSms(from, "INVALID NUMBER"); return; }
+    setTrustedMain(num);
+    enqueueSms(from, String("MAIN SET TO ") + trustedMain);
+    return;
+  }
+  if (up.startsWith("SET ALT ") || up.startsWith("SET SECOND ")) {
+    String num = (up.startsWith("SET ALT ")) ? body.substring(8) : body.substring(11);
+    num.trim();
+    if (num.length() == 0) {
+      setTrustedAlt(""); // clear
+      enqueueSms(from, "ALT CLEARED");
+      return;
+    }
+    setTrustedAlt(num);
+    enqueueSms(from, String("ALT SET TO ") + trustedAlt);
+    return;
+  }
+
   if (up == "GET NUMBERS" || up == "GET LIST" || up == "NUMBERS") {
-    String reply = "MAIN:" + TRUSTED_NUMBER;
+    String reply = trustedMain + "\n";
+    if (trustedAlt.length() > 0) reply += trustedAlt;
     sendSmsChunked(from, reply);
     return;
   }
@@ -520,7 +781,6 @@ void processIncomingSms(const String &fromRaw, const String &bodyRaw) {
     return;
   }
 
-  // Initial liters input
   if (waitingForInitialLiters) {
     bool allDigits = true;
     String tmp = body; tmp.trim();
@@ -568,6 +828,14 @@ void processIncomingSms(const String &fromRaw, const String &bodyRaw) {
     return;
   }
 
+  if (up == "SAVE" || up == "SAVE NOW") {
+    uint16_t cur;
+    noInterrupts(); cur = literCounter; interrupts();
+    requestSave(cur);
+    enqueueSms(from, "SAVED_LITERS=" + String(cur));
+    return;
+  }
+
   if (up == "I SENT" || up == "SENT" || body.indexOf("فرست") != -1 || body.indexOf("فرستادم") != -1) {
     enqueueSms(from, "SAVED_LITERS=" + String(lastSavedLiters));
     return;
@@ -587,7 +855,6 @@ void setup() {
   watchdogEnabled = false;
 #endif
 
-  // Minimal early init only (no Wire, no interrupts)
   pinMode(LED_R, OUTPUT);
   pinMode(LED_G, OUTPUT);
   pinMode(LED_B, OUTPUT);
@@ -603,13 +870,13 @@ void setup() {
     }
   }
 
-  // Start RED and log
+  // Start RED and log — RED stays ON always now
   setLED(true, false, false);
   if (DEBUG) {
     Serial.print(F("LED mapping: RED=D")); Serial.print(LED_R);
     Serial.print(F(" GREEN=D")); Serial.print(LED_G);
     Serial.print(F(" BLUE=D")); Serial.println(LED_B);
-    Serial.println(F("Startup: RED for boot wait, then poll AT+CREG? until registered."));
+    Serial.println(F("Startup: RED ON for boot wait, then poll AT+CREG? until registered."));
     Serial.print(F("Initial wait ms: ")); Serial.println(STARTUP_RED_MS);
   }
 
@@ -667,6 +934,17 @@ void loop() {
   // feed watchdog early in loop to prove liveness if enabled
   feedWatchdog();
 
+  // Handle pending SET timeout (non-blocking) — ensure hall remains responsive
+  if (pendingSetType != PENDING_NONE) {
+    if (millis() - pendingSetAt >= PENDING_TIMEOUT_MS) {
+      if (pendingSetFromOrig.length() > 0) {
+        enqueueSms(pendingSetFromOrig, String("SET TIMEOUT: no number received within 20s"));
+      }
+      if (DEBUG) Serial.println(F("Pending SET timed out — cleared"));
+      clearPendingSet();
+    }
+  }
+
   // when not ready, we still try to probe occasionally (handled earlier) — here we keep old CSQ logic too
   if (!gsmReady && millis() - lastGsmCheck >= GSM_CHECK_INTERVAL_MS) {
     lastGsmCheck = millis();
@@ -686,32 +964,59 @@ void loop() {
           }
           if (stableFor >= GSM_STABLE_DELAY_MS) {
             gsmReady = true;
-            if (!startSent) setLED(true, false, false);
-            else setLED(false, true, false);
-            sendStartToTrustedNumbers();
-            if (DEBUG) Serial.println(F("GSM ready; START queued (stable)"));
+            if (!startSent) {
+              // keep RED on; blink GREEN when candidate
+              ledBlinkState = false; // initialize
+              setLED(true, false, false);
+            } else {
+              // both STARTs already done: RED stays on and GREEN steady
+              setLED(true, true, false);
+            }
+
+            // Start the START sequence (main then alt)
+            sendStartSequence();
+            if (DEBUG) Serial.println(F("GSM ready; START sequence started (main -> alt delayed)"));
           } else {
-            if (!startSent) { ledBlinkState = !ledBlinkState; setLED(ledBlinkState, false, false); }
-            else setLED(false, true, false);
+            if (!startSent) {
+              // before stable: blink GREEN while RED stays on
+              ledBlinkState = !ledBlinkState;
+              setLED(true, ledBlinkState, false);
+            } else {
+              // if already started: keep green steady
+              setLED(true, true, false);
+            }
           }
         } else {
-          if (!startSent) { ledBlinkState = !ledBlinkState; setLED(ledBlinkState, false, false); }
-          else setLED(false, true, false);
+          if (!startSent) {
+            ledBlinkState = !ledBlinkState;
+            setLED(true, ledBlinkState, false);
+          } else {
+            setLED(true, true, false);
+          }
         }
       } else {
         gsmSuccessCount = 0; gsmCandidateSince = 0;
-        if (!startSent) { ledBlinkState = !ledBlinkState; setLED(ledBlinkState, false, false); }
-        else setLED(false, true, false);
+        if (!startSent) {
+          ledBlinkState = !ledBlinkState;
+          setLED(true, ledBlinkState, false);
+        } else {
+          setLED(true, true, false);
+        }
       }
     } else {
       gsmSuccessCount = 0; gsmCandidateSince = 0;
-      if (!startSent) { ledBlinkState = !ledBlinkState; setLED(ledBlinkState, false, false); }
-      else setLED(false, true, false);
+      if (!startSent) {
+        ledBlinkState = !ledBlinkState;
+        setLED(true, ledBlinkState, false);
+      } else {
+        setLED(true, true, false);
+      }
     }
   }
 
   // normal operation after gsmReady
   if (gsmReady) {
+    // process incoming BEFORE draining full queue so we can receive commands quickly
     if (myGSM.available()) {
       if (myGSM.is_SMS()) {
         if (DEBUG) Serial.println(F("New SMS arrived"));
@@ -721,6 +1026,12 @@ void loop() {
       }
     }
 
+    // If ALT START was scheduled, check and send now if time arrived
+    if (startSeqPendingAlt) {
+      sendAltIfScheduled();
+    }
+
+    // send some queued SMSs (bounded number)
     serviceSmsOut();
 
     uint16_t cur;
@@ -748,7 +1059,7 @@ void loop() {
     }
   }
 
-  // Always try to send queued SMS (attempt one send)
+  // Always try to send queued SMS (attempts again)
   serviceSmsOut();
 
   // feed watchdog at end of loop (keeps it alive if enabled)
